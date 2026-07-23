@@ -1,0 +1,98 @@
+name: Deploy to GitHub Pages (data auto-refresh)
+
+# 触发：
+#   1. 定时：每天北京时间 07:00（= UTC 23:00 前一天）自动跑
+#   2. 手动：在 Actions 页面点 "Run workflow" 立即刷新
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+# 允许 GITHUB_TOKEN 推送到本仓库的 gh-pages 分支
+permissions:
+  contents: write
+
+# 避免同一时间多次重叠运行
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source (main)
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # pnpm 偶发丢 transient 文件，提前补回 server-only 的空实现，避免构建报
+      # "Can't resolve 'server-only'"
+      - name: Restore server-only empty.js (pnpm transient fix)
+        run: |
+          echo "// empty for server" > node_modules/server-only/empty.js
+          mkdir -p node_modules/next/dist/compiled/server-only
+          echo "// empty for server" > node_modules/next/dist/compiled/server-only/empty.js
+
+      # 用仓库 Secrets 还原 .env（仅构建机内存中存在，不会进仓库）
+      - name: Create .env from GitHub Secrets
+        run: |
+          cat > .env <<'EOF'
+          FEISHU_APP_ID=${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET=${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_APP_TOKEN=${{ secrets.FEISHU_APP_TOKEN }}
+          FEISHU_INVENTORY_TABLE_ID=${{ secrets.FEISHU_INVENTORY_TABLE_ID }}
+          FEISHU_LOCATION_TABLE_ID=${{ secrets.FEISHU_LOCATION_TABLE_ID }}
+          FEISHU_SALES_TABLE_ID=${{ secrets.FEISHU_SALES_TABLE_ID }}
+          NEXT_PUBLIC_STATIC_MODE=true
+          EOF
+
+      # 拉取飞书最新数据 -> public/data/*.json（失败则中止，不部署旧数据）
+      - name: Fetch fresh data from Feishu
+        run: pnpm exec tsx scripts/fetch-data.ts
+
+      # 静态导出不允许服务端路由 / 开发态 babel 插件，构建时临时移开
+      - name: Disable server route & dev babel for static build
+        run: |
+          [ -d src/app/api ] && mv src/app/api src/app/_api_disabled
+          [ -f .babelrc ] && mv .babelrc .babelrc.disabled
+
+      # 静态导出 + GitHub Pages 子路径 basePath
+      - name: Build static export
+        env:
+          NEXT_STATIC_EXPORT: 'true'
+          NEXT_PUBLIC_STATIC_MODE: 'true'
+          GITHUB_PAGES: 'true'
+        run: pnpm build
+
+      # 还原开发文件，保持源码树干净
+      - name: Restore dev files
+        run: |
+          [ -d src/app/_api_disabled ] && mv src/app/_api_disabled src/app/api
+          [ -f .babelrc.disabled ] && mv .babelrc.disabled .babelrc
+
+      # 用内置 GITHUB_TOKEN 推送到 gh-pages（无需个人 PAT）
+      - name: Deploy to GitHub Pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd out
+          git init -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          touch .nojekyll
+          git add -A
+          git commit -m "deploy: auto data refresh $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" gh-pages

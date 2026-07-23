@@ -19,6 +19,10 @@ const nextConfig: NextConfig = {
   outputFileTracingRoot: path.resolve(__dirname),
   // 静态导出：构建产物输出到 out/，不含服务端路由（飞书 API 在构建前会被临时禁用）
   ...(isStaticExport ? { output: 'export' as const } : {}),
+  // 把 basePath 注入到客户端，方便 fetch 静态资源时拼出正确路径（GitHub Pages 子路径 / EdgeOne 根路径）
+  env: {
+    NEXT_PUBLIC_BASE_PATH: isGitHubPages ? `/${gitHubRepoName}` : '',
+  },
   images: {
     unoptimized: true,
     remotePatterns: [

@@ -151,14 +151,17 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
       // 静态部署模式：始终从本地 /data/*.json 读取预取数据。
       // 部署到 EdgeOne 后是纯静态站，没有 /api/feishu 路由，因此即使点击刷新也只重载已烘焙的静态数据；
       // 最新数据由定时任务（fetch-data.ts + 重新构建部署）推送到 out/。
+      // 注意：GitHub Pages 项目页位于 /store_layout_diagram/ 子路径，需把 basePath 拼到 fetch URL 前缀。
       const isStatic = process.env.NEXT_PUBLIC_STATIC_MODE === 'true';
+      const basePath = process.env.NEXT_PUBLIC_BASE_PATH || '';
+      const dataUrl = (name: string) => `${basePath}/data/${name}.json`;
       const [matchRes, inventoryRes, locationRes, salesRes] = await Promise.all(
         isStatic
           ? [
-              fetch('/data/match.json'),
-              fetch('/data/inventory.json'),
-              fetch('/data/location.json'),
-              fetch('/data/sales.json'),
+              fetch(dataUrl('match')),
+              fetch(dataUrl('inventory')),
+              fetch(dataUrl('location')),
+              fetch(dataUrl('sales')),
             ]
           : [
               fetch(`/api/feishu?action=match${forceRefresh ? '&force=true' : ''}`),
