@@ -1,9 +1,15 @@
 name: Deploy to GitHub Pages (data auto-refresh)
 
 # 触发：
-#   1. 定时：每天北京时间 07:00（= UTC 23:00 前一天）自动跑
-#   2. 手动：在 Actions 页面点 "Run workflow" 立即刷新
+#   1. 推送：main 分支有提交即自动构建部署
+#   2. 定时：每天北京时间 07:00（= UTC 23:00 前一天）自动跑
+#   3. 手动：在 Actions 页面点 "Run workflow" 立即刷新
 on:
+  push:
+    branches: [main]
+    # 只改文档不必重新部署
+    paths-ignore:
+      - '**.md'
   schedule:
     - cron: '0 23 * * *'
   workflow_dispatch:
