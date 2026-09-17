@@ -9,7 +9,7 @@ export const metadata: Metadata = {
     template: '%s | 卖场区域透视表',
   },
   description:
-    '卖场区域透视表：按款号、中类、时段汇总门店销售数据，并以卖场区位可视化呈现，支持飞书多维表格实时同步。',
+    '卖场区域透视表：按款号、中类汇总门店销售数据，并以卖场区位可视化呈现，支持飞书多维表格实时同步。',
   keywords: [
     '卖场区域透视表',
     '门店销售',
@@ -22,7 +22,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: '卖场区域透视表',
     description:
-      '按款号、中类、时段汇总门店销售数据，并以卖场区位可视化呈现，支持飞书多维表格实时同步。',
+      '按款号、中类汇总门店销售数据，并以卖场区位可视化呈现，支持飞书多维表格实时同步。',
     locale: 'zh_CN',
     type: 'website',
   },
