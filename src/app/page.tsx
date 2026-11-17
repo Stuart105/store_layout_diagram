@@ -105,7 +105,7 @@ function SubCategoryTable({ gender, getSubCategoryGenderHourTable, loading }: {
 }
 
 export default function Home() {
-  const { data: contextData, loading, getGlobalSkuTop10ByCategory, getSubCategoryGenderHourTable, refresh } = useSalesData();
+  const { data: contextData, loading, error, getGlobalSkuTop10ByCategory, getSubCategoryGenderHourTable, refresh } = useSalesData();
   const [currentFloor, setCurrentFloor] = useState<string>('all'); // 当前选中楼层
   
   // 全局款号销售TOP10（按大类分组）
@@ -195,6 +195,12 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
       <div className="container mx-auto px-4 py-6 max-w-7xl">
+        {error && (
+          <div role="alert" className="mb-4 flex items-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            <span className="flex-1">数据加载异常：{error}。请检查数据源或稍后重试。</span>
+            <Button variant="outline" size="sm" onClick={() => refresh()}>重试</Button>
+          </div>
+        )}
         {/* 顶部工具栏 - 统一一行 */}
         <div className="flex items-center justify-between gap-2 mb-4 md:mb-6">
           {/* 左侧：标题 */}

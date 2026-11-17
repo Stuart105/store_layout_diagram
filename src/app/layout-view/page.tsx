@@ -63,6 +63,9 @@ interface LocationMarker {
   salesQuantity: number;
   skuCount: number;
   fontSize?: number; // 可选：自定义字体大小
+  showId?: boolean;      // 批量显示设置：默认 true
+  showAmount?: boolean;  // 批量显示设置：默认 true
+  showQty?: boolean;     // 批量显示设置：默认 true
   // 保存时记录背景图尺寸，用于坐标转换
   bgWidth?: number;
   bgHeight?: number;
@@ -95,6 +98,29 @@ const SNAP_THRESHOLD = 1.5;
 const DEFAULT_WIDTH = 3;
 const DEFAULT_HEIGHT = 4;
 
+// localStorage 容错：脏数据不再导致整页白屏，容量超限给出可操作提示
+const safeParse = <T,>(key: string, fallback: T): T => {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch (e) {
+    console.warn(`本地数据 ${key} 解析失败，已忽略:`, e);
+    try { localStorage.removeItem(key); } catch { /* 存储不可用时忽略 */ }
+    return fallback;
+  }
+};
+
+const safeSet = (key: string, value: unknown): boolean => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (e) {
+    console.error(`本地数据 ${key} 保存失败:`, e);
+    toast.error('本地存储空间不足，请更换较小的背景图或清理浏览器数据');
+    return false;
+  }
+};
+
 // 楼层配置
 const FLOORS = [
   { id: '1', name: '1F仓库', type: 'warehouse' as const },
@@ -126,6 +152,9 @@ export default function LayoutViewPage() {
   
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragFrameRef = useRef<number | null>(null);
+  const pendingDragRef = useRef<{ x: number; y: number; snapLines: { vertical: number[]; horizontal: number[] } } | null>(null);
+  const locationsRef = useRef<LocationMarker[]>([]);
   const [showGrid, setShowGrid] = useState(false);
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [draggingLocation, setDraggingLocation] = useState<string | null>(null);
@@ -166,46 +195,24 @@ export default function LayoutViewPage() {
 
   // 加载本地存储的区位数据和楼层配置
   useEffect(() => {
-    // 加载楼层配置
-    const savedFloors = localStorage.getItem('storeFloors');
-    if (savedFloors) {
-      setFloors(JSON.parse(savedFloors));
-    }
-    
-    // 加载所有楼层的背景图
-    const savedBackgrounds = localStorage.getItem('storeBackgroundImages');
-    if (savedBackgrounds) {
-      setBackgroundImages(JSON.parse(savedBackgrounds));
-    }
-    
-    // 加载背景图比例
-    const savedRatios = localStorage.getItem('storeBackgroundRatios');
-    if (savedRatios) {
-      setBackgroundRatios(JSON.parse(savedRatios));
-    }
-    
-    // 加载背景图尺寸
-    const savedSizes = localStorage.getItem('storeBackgroundSizes');
-    if (savedSizes) {
-      const sizes = JSON.parse(savedSizes);
-      if (sizes[currentFloor]) {
-        setBgImageSize(sizes[currentFloor]);
-      }
-    }
-    
-    // 加载视图锚点
-    const savedAnchors = localStorage.getItem('storeViewAnchors');
-    if (savedAnchors) {
-      setViewAnchors(JSON.parse(savedAnchors));
-    }
+    setFloors(safeParse('storeFloors', FLOORS));
+    setBackgroundImages(safeParse('storeBackgroundImages', {}));
+    setBackgroundRatios(safeParse('storeBackgroundRatios', {}));
+    const sizes = safeParse<Record<string, { width: number; height: number }>>('storeBackgroundSizes', {});
+    if (sizes[currentFloor]) setBgImageSize(sizes[currentFloor]);
+    setViewAnchors(safeParse('storeViewAnchors', {}));
   }, []);
+
+  // 同步最新区位列表，供拖拽结束时保存（避免闭包拿到过期 state）
+  useEffect(() => {
+    locationsRef.current = locations;
+  }, [locations]);
 
   // 当楼层切换时，加载该楼层的区位数据
   useEffect(() => {
-    const floorLocations = localStorage.getItem(`storeLocations_${currentFloor}`);
+    const floorLocations = safeParse<LocationMarker[] | null>(`storeLocations_${currentFloor}`, null);
     if (floorLocations) {
-      const parsedLocations: LocationMarker[] = JSON.parse(floorLocations);
-      const uniqueLocations = parsedLocations.filter((loc, index, self) => 
+      const uniqueLocations = floorLocations.filter((loc, index, self) =>
         index === self.findIndex(l => l.id === loc.id)
       );
       setLocations(uniqueLocations);
@@ -218,7 +225,7 @@ export default function LayoutViewPage() {
     }
     
     // 加载该楼层的背景图尺寸
-    const savedSizes = JSON.parse(localStorage.getItem('storeBackgroundSizes') || '{}');
+    const savedSizes = safeParse<Record<string, { width: number; height: number }>>('storeBackgroundSizes', {});
     if (savedSizes[currentFloor]) {
       setBgImageSize(savedSizes[currentFloor]);
     } else {
@@ -233,14 +240,19 @@ export default function LayoutViewPage() {
   useEffect(() => {
     if (!contextLoading && contextDataMap.size > 0) {
       setLocations(prev => {
-        // 如果没有区位数据，不更新
-        if (prev.length === 0) return prev;
-        
+        // 直接打开本页时，楼层 effect 可能早于 Context 数据加载完成，这里补建自动布局。
+        // 若用户主动保存过空布局（[]），则尊重用户选择不重建。
+        if (prev.length === 0) {
+          const saved = safeParse<LocationMarker[] | null>(`storeLocations_${currentFloor}`, null);
+          if (saved === null) return createAutoLocations(contextDataMap, currentFloor);
+          return prev;
+        }
+
         return prev.map(loc => {
           let sales = contextDataMap.get(loc.id);
           if (!sales) {
             for (const [key, value] of contextDataMap.entries()) {
-              if (key.startsWith(loc.id) || loc.id.startsWith(key)) {
+              if ((key.startsWith(loc.id) || loc.id.startsWith(key)) && key[0] === loc.id[0] && Math.abs(key.length - loc.id.length) <= 1) {
                 sales = value;
                 break;
               }
@@ -302,21 +314,24 @@ export default function LayoutViewPage() {
 
   // 保存配置（按楼层保存）
   const saveToStorage = (data: LocationMarker[]) => {
-    const uniqueData = data.filter((loc, index, self) => 
-      index === self.findLastIndex(l => l.id === loc.id)
-    );
-    localStorage.setItem(`storeLocations_${currentFloor}`, JSON.stringify(uniqueData));
-    setSaveStatus('saved');
+    // 保留最后一次出现的重复项，同时兼容不支持 findLastIndex 的浏览器
+    const seen = new Set<string>();
+    const uniqueData = [...data].reverse().filter(loc => {
+      if (seen.has(loc.id)) return false;
+      seen.add(loc.id);
+      return true;
+    }).reverse();
+    if (safeSet(`storeLocations_${currentFloor}`, uniqueData)) setSaveStatus('saved');
   };
 
   // 保存楼层配置
   const saveFloorsToStorage = (newFloors: typeof floors) => {
-    localStorage.setItem('storeFloors', JSON.stringify(newFloors));
+    safeSet('storeFloors', newFloors);
   };
 
   // 保存背景图配置
   const saveBackgroundsToStorage = (newBackgrounds: Record<string, string>) => {
-    localStorage.setItem('storeBackgroundImages', JSON.stringify(newBackgrounds));
+    safeSet('storeBackgroundImages', newBackgrounds);
     setBackgroundImages(newBackgrounds);
   };
 
@@ -428,28 +443,45 @@ export default function LayoutViewPage() {
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    
+
+    // 统一落盘入口：尺寸、图片都走 safeSet，避免 QuotaExceededError 白屏
+    const saveBackground = (url: string, width: number, height: number) => {
+      setBgImageSize({ width, height });
+      const savedSizes = safeParse<Record<string, { width: number; height: number }>>('storeBackgroundSizes', {});
+      savedSizes[currentFloor] = { width, height };
+      safeSet('storeBackgroundSizes', savedSizes);
+      const next = { ...backgroundImages, [currentFloor]: url };
+      if (safeSet('storeBackgroundImages', next)) {
+        setBackgroundImages(next);
+        toast.success(`背景图已加载 (${width}×${height})`);
+      }
+    };
+
     const reader = new FileReader();
     reader.onload = (event) => {
       const dataUrl = event.target?.result as string;
-      
-      // 获取图片实际尺寸
       const img = new window.Image();
       img.onload = () => {
-        // 保存背景图尺寸
-        setBgImageSize({ width: img.width, height: img.height });
-        
-        // 保存到 localStorage
-        const savedSizes = JSON.parse(localStorage.getItem('storeBackgroundSizes') || '{}');
-        savedSizes[currentFloor] = { width: img.width, height: img.height };
-        localStorage.setItem('storeBackgroundSizes', JSON.stringify(savedSizes));
-        
-        toast.success(`背景图已加载 (${img.width}×${img.height})`);
+        const MAX_EDGE = 1600;
+        const MAX_BYTES = 1.5 * 1024 * 1024;
+        // 大图先压缩，localStorage 通常只有 5MB，原图 base64 极易超限
+        if (Math.max(img.width, img.height) > MAX_EDGE || dataUrl.length > MAX_BYTES) {
+          const ratio = Math.min(1, MAX_EDGE / Math.max(img.width, img.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(img.width * ratio);
+          canvas.height = Math.round(img.height * ratio);
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            saveBackground(canvas.toDataURL('image/jpeg', 0.82), canvas.width, canvas.height);
+            return;
+          }
+        }
+        saveBackground(dataUrl, img.width, img.height);
       };
       img.src = dataUrl;
-      
-      const newBackgrounds = { ...backgroundImages, [currentFloor]: dataUrl };
-      saveBackgroundsToStorage(newBackgrounds);
     };
     reader.readAsDataURL(file);
   };
@@ -469,7 +501,7 @@ export default function LayoutViewPage() {
     
     const newAnchors = { ...viewAnchors, [name]: { x: position.x, y: position.y, scale } };
     setViewAnchors(newAnchors);
-    localStorage.setItem('storeViewAnchors', JSON.stringify(newAnchors));
+    safeSet('storeViewAnchors', newAnchors);
     toast.success(`锚点「${name}」已保存`);
   };
 
@@ -484,7 +516,7 @@ export default function LayoutViewPage() {
     const newAnchors = { ...viewAnchors };
     delete newAnchors[name];
     setViewAnchors(newAnchors);
-    localStorage.setItem('storeViewAnchors', JSON.stringify(newAnchors));
+    safeSet('storeViewAnchors', newAnchors);
     toast.success(`锚点「${name}」已删除`);
   };
 
@@ -504,13 +536,19 @@ export default function LayoutViewPage() {
       const loc = locations.find(l => l.id === draggingLocation);
       if (loc) {
         const snapped = calculateSnapPosition(x, y, draggingLocation, loc.width, loc.height);
-        
-        setLocations(prev => prev.map(l => 
-          l.id === draggingLocation 
-            ? { ...l, x: snapped.x, y: snapped.y }
-            : l
-        ));
-        setSnapLines(snapped.snapLines);
+        // 用 rAF 合并高频 mousemove，避免每个像素都触发全量区位重渲染
+        pendingDragRef.current = snapped;
+        if (dragFrameRef.current === null) {
+          dragFrameRef.current = requestAnimationFrame(() => {
+            dragFrameRef.current = null;
+            const pending = pendingDragRef.current;
+            if (!pending) return;
+            setLocations(prev => prev.map(l =>
+              l.id === draggingLocation ? { ...l, x: pending.x, y: pending.y } : l
+            ));
+            setSnapLines(pending.snapLines);
+          });
+        }
         markUnsaved(); // 标记为未保存
       }
       return;
@@ -525,19 +563,26 @@ export default function LayoutViewPage() {
 
   const handleMouseUp = () => {
     if (draggingLocation) {
+      // 落下最后一帧，避免鼠标松开时位置回退
+      if (dragFrameRef.current !== null) {
+        cancelAnimationFrame(dragFrameRef.current);
+        dragFrameRef.current = null;
+      }
+      const pending = pendingDragRef.current;
+      pendingDragRef.current = null;
+      if (pending) {
+        setLocations(prev => prev.map(l =>
+          l.id === draggingLocation ? { ...l, x: pending.x, y: pending.y } : l
+        ));
+      }
       setDraggingLocation(null);
       setSnapLines({ vertical: [], horizontal: [] });
-      // 使用 setTimeout 确保 state 已更新后再保存
+      // 用 ref 读取最新列表；key 必须与写入端一致（按楼层）
       setTimeout(() => {
-        const savedData = localStorage.getItem('storeLocations');
-        if (savedData) {
-          const parsed = JSON.parse(savedData);
-          // 只有当数据确实变化时才保存
-          if (JSON.stringify(parsed) !== JSON.stringify(locations)) {
-            saveToStorage(locations);
-          }
-        } else {
-          saveToStorage(locations);
+        const latest = locationsRef.current;
+        const saved = safeParse<LocationMarker[] | null>(`storeLocations_${currentFloor}`, null);
+        if (!saved || JSON.stringify(saved) !== JSON.stringify(latest)) {
+          saveToStorage(latest);
         }
       }, 50);
     }
@@ -804,7 +849,7 @@ export default function LayoutViewPage() {
             if (!sales) {
               // 尝试模糊匹配
               for (const [key, value] of contextDataMap.entries()) {
-                if (key.startsWith(loc.id) || loc.id.startsWith(key)) {
+                if ((key.startsWith(loc.id) || loc.id.startsWith(key)) && key[0] === loc.id[0] && Math.abs(key.length - loc.id.length) <= 1) {
                   sales = value;
                   break;
                 }
@@ -830,7 +875,7 @@ export default function LayoutViewPage() {
               const ratio = img.width / img.height;
               const newRatios = { ...backgroundRatios, [currentFloor]: ratio };
               setBackgroundRatios(newRatios);
-              localStorage.setItem('storeBackgroundRatios', JSON.stringify(newRatios));
+              safeSet('storeBackgroundRatios', newRatios);
             };
             img.src = backgroundImage;
           }
@@ -873,7 +918,7 @@ export default function LayoutViewPage() {
                 const ratio = img.width / img.height;
                 const newRatios = { ...backgroundRatios, [currentFloor]: ratio };
                 setBackgroundRatios(newRatios);
-                localStorage.setItem('storeBackgroundRatios', JSON.stringify(newRatios));
+                safeSet('storeBackgroundRatios', newRatios);
               };
               img.src = data.backgroundImage;
             }
@@ -899,7 +944,7 @@ export default function LayoutViewPage() {
   }
   
   const getRecentDriveTokens = (): DriveTokenItem[] => {
-    const recentTokens = JSON.parse(localStorage.getItem('feishuDriveRecentTokens') || '[]');
+    const recentTokens = safeParse<DriveTokenItem[]>('feishuDriveRecentTokens', []);
     return recentTokens.slice(0, 10);
   };
 
@@ -927,7 +972,7 @@ export default function LayoutViewPage() {
         const { file_token, file_name } = result.data || {};
         
         // 保存到最近token列表
-        const recentTokens = JSON.parse(localStorage.getItem('feishuDriveRecentTokens') || '[]');
+        const recentTokens = safeParse<DriveTokenItem[]>('feishuDriveRecentTokens', []);
         const newEntry = { 
           floor: currentFloor, 
           token: file_token, 
@@ -942,7 +987,7 @@ export default function LayoutViewPage() {
         // 最多保留10个
         const trimmed = filtered.slice(0, 10);
         
-        localStorage.setItem('feishuDriveRecentTokens', JSON.stringify(trimmed));
+        safeSet('feishuDriveRecentTokens', trimmed);
         
         alert(`✅ 布局已保存到飞书云盘！\n\n文件名：${file_name}`);
       } else {
@@ -980,7 +1025,7 @@ export default function LayoutViewPage() {
             let sales = contextDataMap.get(loc.id);
             if (!sales) {
               for (const [key, value] of contextDataMap.entries()) {
-                if (key.startsWith(loc.id) || loc.id.startsWith(key)) {
+                if ((key.startsWith(loc.id) || loc.id.startsWith(key)) && key[0] === loc.id[0] && Math.abs(key.length - loc.id.length) <= 1) {
                   sales = value;
                   break;
                 }
@@ -1006,7 +1051,7 @@ export default function LayoutViewPage() {
               const ratio = img.width / img.height;
               const newRatios = { ...backgroundRatios, [targetFloor]: ratio };
               setBackgroundRatios(newRatios);
-              localStorage.setItem('storeBackgroundRatios', JSON.stringify(newRatios));
+              safeSet('storeBackgroundRatios', newRatios);
             };
             img.src = backgroundImage;
           }
@@ -1060,7 +1105,7 @@ export default function LayoutViewPage() {
           const selectedFile = layoutFiles[index];
           
           // 保存到本地记录
-          const recentTokens = JSON.parse(localStorage.getItem('feishuDriveRecentTokens') || '[]');
+          const recentTokens = safeParse<DriveTokenItem[]>('feishuDriveRecentTokens', []);
           const floorMatch = selectedFile.name.match(/(\d+)F/);
           const floor = floorMatch ? floorMatch[1] : '5';
           
@@ -1073,7 +1118,7 @@ export default function LayoutViewPage() {
             savedAt: new Date().toISOString()
           });
           const trimmed = filtered.slice(0, 10);
-          localStorage.setItem('feishuDriveRecentTokens', JSON.stringify(trimmed));
+          safeSet('feishuDriveRecentTokens', trimmed);
           
           // 直接加载
           loadFromDrive(selectedFile.token);
@@ -1094,6 +1139,27 @@ export default function LayoutViewPage() {
     
     return { totalAmount, totalQuantity, totalLocations: locations.length, activeLocations };
   }, [locations]);
+
+  // 本楼层销售额 TOP3 区位：金色描边，便于快速定位高产出位置
+  const topLocationIds = useMemo(
+    () => new Set([...locations].sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 3).map(loc => loc.id)),
+    [locations]
+  );
+
+  // 库存健康角标：有销售但零库存=缺货，有库存但零销售=滞销
+  const stockHealthMap = useMemo(() => {
+    const map = new Map<string, { outOfStock: number; slowMoving: number }>();
+    locations.forEach(loc => {
+      let outOfStock = 0;
+      let slowMoving = 0;
+      getLocationSkuDetails(loc.id).forEach(sku => {
+        if (sku.stock === 0 && sku.salesQuantity > 0) outOfStock++;
+        if (sku.stock > 0 && sku.salesQuantity === 0) slowMoving++;
+      });
+      map.set(loc.id, { outOfStock, slowMoving });
+    });
+    return map;
+  }, [locations, getLocationSkuDetails]);
 
   // 获取热力颜色（按成交金额绝对挡位：每500元一档）
   const getHeatColor = useCallback((amount: number) => {
@@ -1276,6 +1342,34 @@ export default function LayoutViewPage() {
             >
               <Maximize2 className="w-4 h-4" />
             </Button>
+
+            {/* 视图锚点：把常用观察位置（入口/收银台）一键保存并跳转 */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" className="rounded-lg w-8 h-8" title="视图锚点" aria-label="视图锚点">
+                  <MapPin className="w-4 h-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <DropdownMenuLabel>视图锚点</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={handleSaveAnchor}>保存当前视图</DropdownMenuItem>
+                {Object.keys(viewAnchors).length > 0 && <DropdownMenuSeparator />}
+                {Object.entries(viewAnchors).map(([name, anchor]) => (
+                  <DropdownMenuItem key={name} onClick={() => handleGoToAnchor(anchor)}>
+                    <span className="flex-1">{name}</span>
+                    <span
+                      role="button"
+                      aria-label={`删除锚点 ${name}`}
+                      className="ml-2 text-muted-foreground hover:text-destructive"
+                      onClick={(e) => { e.stopPropagation(); handleDeleteAnchor(name); }}
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             {/* 批量调整大小 */}
             <Dialog>
@@ -1479,7 +1573,6 @@ export default function LayoutViewPage() {
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
               onMouseUp={handleMouseUp}
-              onMouseLeave={handleMouseUp}
             >
               <div
                 style={{
@@ -1549,16 +1642,19 @@ export default function LayoutViewPage() {
                 )}
                 
                 {/* 上层：方形区位标记 */}
-                {locations.map((loc, index) => {
-                  // 根据内容长度调整显示
-                  const idLength = String(loc.id).length;
-                  const amountText = `¥${Math.abs(Math.round(loc.salesAmount))}`;
-                  const qtyText = `${Math.abs(Math.ceil(loc.salesQuantity)) || Math.abs(Math.round(loc.salesQuantity)) || 0}件`;
-                  const showFullInfo = loc.width >= 4 && loc.height >= 3.5;
-                  
+                {locations.map((loc) => {
+                  const showId = loc.showId !== false;
+                  const showAmount = loc.showAmount !== false;
+                  const showQty = loc.showQty !== false;
+                  const isTop = topLocationIds.has(loc.id);
+                  const health = stockHealthMap.get(loc.id);
+
                   return (
                     <div
                       key={loc.id}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`区位 ${loc.id}，销售额 ${Math.round(loc.salesAmount)} 元`}
                       className={`absolute transition-transform duration-75 ${
                         editMode ? 'cursor-move' : 'cursor-pointer'
                       }`}
@@ -1571,12 +1667,28 @@ export default function LayoutViewPage() {
                       }}
                       onMouseDown={(e) => handleLocationDragStart(e, loc)}
                       onClick={() => handleLocationClick(loc)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          handleLocationClick(loc);
+                        }
+                      }}
                     >
+                      {(health?.outOfStock || health?.slowMoving) ? (
+                        <div className="absolute -top-2 right-0 z-20 flex gap-0.5 text-[9px] leading-none">
+                          {health!.outOfStock > 0 && (
+                            <span className="rounded bg-rose-600 px-1 py-0.5 text-white">缺{health!.outOfStock}</span>
+                          )}
+                          {health!.slowMoving > 0 && (
+                            <span className="rounded bg-slate-600 px-1 py-0.5 text-white">滞{health!.slowMoving}</span>
+                          )}
+                        </div>
+                      ) : null}
                       {/* 方形标记 */}
                       <div
                         className={`w-full h-full rounded-lg flex flex-col items-center justify-center text-white shadow-lg transition-all overflow-hidden ${
                           editMode && draggingLocation === loc.id ? 'ring-2 ring-blue-500 ring-offset-1' : ''
-                        } ${selectedLocation === loc.id ? 'ring-2 ring-white' : ''}`}
+                        } ${isTop ? 'ring-2 ring-amber-300' : ''} ${selectedLocation === loc.id ? 'ring-2 ring-white' : ''}`}
                         style={{
                           backgroundColor: getHeatColor(loc.salesAmount),
                           fontSize: loc.fontSize ? `${loc.fontSize}px` : (loc.width >= 4 ? '11px' : loc.width >= 3 ? '10px' : '9px'),
@@ -1584,20 +1696,26 @@ export default function LayoutViewPage() {
                         }}
                         title={`区位: ${loc.id}\n销售金额: ¥${loc.salesAmount || 0}\n销售件数: ${loc.salesQuantity || 0}\nSKU数: ${loc.skuCount || 0}`}
                       >
-                        {/* 金额/件数 - 上方，显示格式 ¥599/1件 */}
-                        <div className="flex flex-col items-center justify-center leading-tight">
-                          <div className="font-semibold" style={{ fontSize: loc.fontSize ? `${loc.fontSize}px` : 'inherit' }}>
-                            ¥{Math.abs(Math.round(loc.salesAmount || 0))}/{Math.abs(Math.ceil(loc.salesQuantity || 0)) || 0}
+                        {/* 金额/件数 - 受批量"显示内容"开关控制 */}
+                        {(showAmount || showQty) && (
+                          <div className="flex flex-col items-center justify-center leading-tight">
+                            <div className="font-semibold" style={{ fontSize: loc.fontSize ? `${loc.fontSize}px` : 'inherit' }}>
+                              {showAmount ? `¥${Math.abs(Math.round(loc.salesAmount || 0))}` : ''}
+                              {showAmount && showQty ? '/' : ''}
+                              {showQty ? `${Math.abs(Math.ceil(loc.salesQuantity || 0)) || 0}件` : ''}
+                            </div>
                           </div>
-                        </div>
-                        
+                        )}
+
                         {/* 区位ID - 下方 */}
-                        <div 
-                          className="font-bold leading-tight mt-auto pt-0.5" 
-                          style={{ fontSize: loc.fontSize ? `${Math.max(8, loc.fontSize - 2)}px` : 'inherit' }}
-                        >
-                          {loc.id}
-                        </div>
+                        {showId && (
+                          <div
+                            className="font-bold leading-tight mt-auto pt-0.5"
+                            style={{ fontSize: loc.fontSize ? `${Math.max(8, loc.fontSize - 2)}px` : 'inherit' }}
+                          >
+                            {loc.id}
+                          </div>
+                        )}
                       </div>
                     </div>
                   );
@@ -1634,6 +1752,11 @@ export default function LayoutViewPage() {
                 <div className="w-3 h-3 rounded-sm bg-gray-400"></div>
                 <span>无（0）</span>
               </div>
+            </div>
+            <div className="flex items-center justify-center gap-6 text-xs flex-wrap mt-2 text-muted-foreground">
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm border-2 border-amber-300"></span>TOP3 区位</span>
+              <span className="flex items-center gap-1"><span className="rounded bg-rose-600 px-1 text-white">缺N</span>有销售但零库存款数</span>
+              <span className="flex items-center gap-1"><span className="rounded bg-slate-600 px-1 text-white">滞N</span>有库存但零销售款数</span>
             </div>
           </div>
         </Card>
@@ -1779,11 +1902,20 @@ export default function LayoutViewPage() {
                         const newFloors = floors.filter((_, i) => i !== index);
                         setFloors(newFloors);
                         saveFloorsToStorage(newFloors);
-                        // 删除该楼层的区位数据和背景图
+                        // 删除该楼层的全部残留数据（区位/背景/尺寸/比例/锚点）
                         localStorage.removeItem(`storeLocations_${floor.id}`);
                         const newBackgrounds = { ...backgroundImages };
                         delete newBackgrounds[floor.id];
                         saveBackgroundsToStorage(newBackgrounds);
+                        const newSizes = safeParse<Record<string, unknown>>('storeBackgroundSizes', {});
+                        delete newSizes[floor.id];
+                        safeSet('storeBackgroundSizes', newSizes);
+                        const newRatios = { ...backgroundRatios };
+                        delete newRatios[floor.id];
+                        safeSet('storeBackgroundRatios', newRatios);
+                        const newAnchors = { ...viewAnchors };
+                        delete newAnchors[floor.id];
+                        safeSet('storeViewAnchors', newAnchors);
                         // 如果删除的是当前楼层，切换到第一个楼层
                         if (currentFloor === floor.id) {
                           setCurrentFloor(newFloors[0].id);
@@ -1807,7 +1939,7 @@ export default function LayoutViewPage() {
                 className="flex-1 rounded-lg"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && newFloorName.trim()) {
-                    const newFloorId = `${Math.max(...floors.map(f => parseInt(f.id))) + 1}`;
+                    const newFloorId = `${Math.max(0, ...floors.map(f => Number.parseInt(f.id, 10) || 0)) + 1}`;
                     const newFloors = [...floors, { id: newFloorId, name: newFloorName.trim(), type: 'store' as const }];
                     setFloors(newFloors);
                     saveFloorsToStorage(newFloors);
@@ -1818,7 +1950,7 @@ export default function LayoutViewPage() {
               <Button
                 onClick={() => {
                   if (newFloorName.trim()) {
-                    const newFloorId = `${Math.max(...floors.map(f => parseInt(f.id))) + 1}`;
+                    const newFloorId = `${Math.max(0, ...floors.map(f => Number.parseInt(f.id, 10) || 0)) + 1}`;
                     const newFloors = [...floors, { id: newFloorId, name: newFloorName.trim(), type: 'store' as const }];
                     setFloors(newFloors);
                     saveFloorsToStorage(newFloors);

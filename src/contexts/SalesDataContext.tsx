@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useMemo, ReactNode } from 'react';
 
 interface SalesData {
   area: string;
@@ -37,6 +37,7 @@ interface SalesDataContextType {
   data: SalesData[];
   dataMap: Map<string, SalesData>;
   loading: boolean;
+  error: string | null;
   lastFetchTime: number | null;
   refresh: () => Promise<void>;
   // 新增：获取区位SKU详情（从缓存中获取，速度极快）
@@ -78,6 +79,7 @@ const SalesDataContext = createContext<SalesDataContextType | null>(null);
 
 // 缓存时间：5分钟
 const CACHE_TTL = 5 * 60 * 1000;
+const CACHE_KEY = 'salesDataCacheV2';
 
 // 清理字段值（去掉 ="xxx" 格式的前缀和引号）
 const cleanFieldValue = (value: any): string => {
@@ -96,6 +98,7 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<SalesData[]>([]);
   const [dataMap, setDataMap] = useState<Map<string, SalesData>>(new Map());
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [lastFetchTime, setLastFetchTime] = useState<number | null>(null);
   
   // 新增：缓存数据
@@ -124,26 +127,39 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
 
   const fetchData = async (forceRefresh = false) => {
     // 检查是否需要刷新（超过5分钟或强制刷新）
-    const shouldRefresh = forceRefresh || 
-      !lastFetchTime || 
+    const shouldRefresh = forceRefresh ||
+      !lastFetchTime ||
       Date.now() - lastFetchTime > CACHE_TTL;
-    
-    // 尝试从 localStorage 恢复 locationStyleCodesMap
+
+    if (forceRefresh) setLoading(true);
+    setError(null);
+
+    // 从 localStorage 完整恢复缓存（旧版只恢复区位款号映射，其余状态为空会导致数据不一致）
     if (!shouldRefresh && data.length > 0) {
       try {
-        const savedMapStr = localStorage.getItem('locationStyleCodesMap');
-        if (savedMapStr) {
-          const savedMapObj = JSON.parse(savedMapStr) as Record<string, string[]>;
-          const locMap = new Map<string, string[]>();
-          Object.entries(savedMapObj).forEach(([key, value]) => {
-            locMap.set(key, value);
-          });
-          setLocationStyleCodesMap(locMap);
+        const saved = localStorage.getItem(CACHE_KEY);
+        if (saved) {
+          const cache = JSON.parse(saved);
+          setLocationStyleCodesMap(new Map(Object.entries(cache.locationStyleCodesMap || {})));
+          setInventoryMap(new Map(Object.entries(cache.inventoryMap || [])));
+          setSalesByStyleCode(new Map(Object.entries(cache.salesByStyleCode || [])));
+          setCategoryMap(new Map(Object.entries(cache.categoryMap || [])));
+          setStyleCodeLocationCount(cache.styleCodeLocationCount || {});
+          setStyleCodeLocations(cache.styleCodeLocations || {});
+          setSubCategorySales(cache.subCategorySales || {});
+          setHourlySales(cache.hourlySales || {});
+          setSubCategoryGenderHour(cache.subCategoryGenderHour || {});
+          setOnlineSalesByStyleCode(cache.onlineSalesByStyleCode || {});
+          setOnlineSalesBySubCategory(cache.onlineSalesBySubCategory || {});
+          setOnlineSalesByHour(cache.onlineSalesByHour || {});
+          setOnlineSubCategoryGenderHour(cache.onlineSubCategoryGenderHour || {});
+          setOnlineCategoryMap(new Map(Object.entries(cache.onlineCategoryMap || [])));
+          return;
         }
       } catch (e) {
-        console.error('恢复区位款号映射失败:', e);
+        console.warn('恢复数据缓存失败，将重新拉取:', e);
       }
-      return;
+      // 缓存不可用时继续走网络请求，不要用空状态提前返回
     }
 
     try {
@@ -154,7 +170,8 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
       // 注意：GitHub Pages 项目页位于 /store_layout_diagram/ 子路径，需把 basePath 拼到 fetch URL 前缀。
       const isStatic = process.env.NEXT_PUBLIC_STATIC_MODE === 'true';
       const basePath = process.env.NEXT_PUBLIC_BASE_PATH || '';
-      const dataUrl = (name: string) => `${basePath}/data/${name}.json`;
+      // 加时间戳绕过 CDN/浏览器缓存，保证静态站重建后刷新能拿到新数据
+      const dataUrl = (name: string) => `${basePath}/data/${name}.json?t=${Date.now()}`;
       const [matchRes, inventoryRes, locationRes, salesRes] = await Promise.all(
         isStatic
           ? [
@@ -171,9 +188,21 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
             ]
       );
 
+      const responses = [
+        { name: '区位汇总', res: matchRes },
+        { name: '库存', res: inventoryRes },
+        { name: '区位表', res: locationRes },
+        { name: '销售', res: salesRes },
+      ];
+      const failed = responses.filter(item => !item.res.ok);
+      if (failed.length > 0) {
+        throw new Error(`${failed.map(item => item.name).join('、')}数据加载失败（HTTP ${failed.map(item => item.res.status).join('/')}）`);
+      }
+
       const matchResult = await matchRes.json();
       const inventoryResult = await inventoryRes.json();
-      const locationResult = await locationRes.json();
+      // 区位表只作可用性校验，业务字段来自 match 汇总
+      await locationRes.json();
       const salesResult = await salesRes.json();
 
       if (matchResult.code === 0 && matchResult.data?.locations) {
@@ -314,16 +343,16 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
         salesResult.data.items.forEach((record: any) => {
           const fields = record.fields || {};
           const styleCode = cleanFieldValue(fields['款号']);
-          const quantity = parseInt(cleanFieldValue(fields['数量'])) || 0;
-          // 尝试多个可能的金额字段名
-          const amount = parseInt(cleanFieldValue(fields['成交金额 (1)'])) || 
-                         parseInt(cleanFieldValue(fields['成交金额（1）'])) ||
-                         parseInt(cleanFieldValue(fields['成交金额'])) || 0;
+          const quantity = parseInt(cleanFieldValue(fields['数量']), 10) || 0;
+          // 金额必须保留小数，parseInt 会截断成交金额导致销售额系统性偏低
+          const amount = parseFloat(cleanFieldValue(fields['成交金额 (1)'])) ||
+                         parseFloat(cleanFieldValue(fields['成交金额（1）'])) ||
+                         parseFloat(cleanFieldValue(fields['成交金额'])) || 0;
           // 获取品类信息（从销售表的"款号.大类.属性描述"字段）
           const category = cleanFieldValue(fields['款号.大类.属性描述']) || '';
           
           // 排除线上销售（手工改价/手动改价="Y"），与后端 /api/feishu?action=match 口径保持一致
-          const manualChangePrice = cleanFieldValue(fields['手工改价']) || cleanFieldValue(fields['手动改价']);
+          const manualChangePrice = (cleanFieldValue(fields['手工改价']) || cleanFieldValue(fields['手动改价'])).trim().toUpperCase();
           if (manualChangePrice === 'Y') return;
           
           if (styleCode) {
@@ -339,8 +368,13 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
           }
         });
         setSalesByStyleCode(salesMap);
-        setCategoryMap(categoryMap);
-        
+        // 合并而非整体覆盖：否则 sales 请求少页时会丢掉 match 返回的品类映射
+        setCategoryMap(prev => {
+          const merged = new Map(prev);
+          categoryMap.forEach((cat, styleCode) => merged.set(styleCode, cat));
+          return merged;
+        });
+
         // 同时更新库存数据中的品类信息（从销售表获取）
         setInventoryMap(prev => {
           const newMap = new Map(prev);
@@ -355,20 +389,54 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
       }
 
       setLastFetchTime(Date.now());
-    } catch (error) {
-      console.error('Error fetching data:', error);
+    } catch (err) {
+      console.error('Error fetching data:', err);
+      setError(err instanceof Error ? err.message : '数据加载失败，请稍后重试');
     } finally {
       setLoading(false);
     }
   };
 
+  // 所有派生状态落定后统一写缓存，保证恢复时不会只恢复其中一部分
+  useEffect(() => {
+    if (!lastFetchTime) return;
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify({
+        locationStyleCodesMap: Object.fromEntries(locationStyleCodesMap),
+        inventoryMap: Array.from(inventoryMap),
+        salesByStyleCode: Array.from(salesByStyleCode),
+        categoryMap: Array.from(categoryMap),
+        styleCodeLocationCount,
+        styleCodeLocations,
+        subCategorySales,
+        hourlySales,
+        subCategoryGenderHour,
+        onlineSalesByStyleCode,
+        onlineSalesBySubCategory,
+        onlineSalesByHour,
+        onlineSubCategoryGenderHour,
+        onlineCategoryMap: Array.from(onlineCategoryMap),
+      }));
+    } catch (e) {
+      console.warn('保存数据缓存失败:', e);
+    }
+  }, [lastFetchTime, locationStyleCodesMap, inventoryMap, salesByStyleCode, categoryMap,
+      styleCodeLocationCount, styleCodeLocations, subCategorySales, hourlySales,
+      subCategoryGenderHour, onlineSalesByStyleCode, onlineSalesBySubCategory,
+      onlineSalesByHour, onlineSubCategoryGenderHour, onlineCategoryMap]);
+
   // 从缓存中获取区位SKU详情
   const getLocationSkuDetails = (locationId: string): SkuDetail[] => {
     const styleCodes: string[] = [];
     
-    // 查找匹配的区位（支持模糊匹配）
-    for (const [locId, codes] of locationStyleCodesMap.entries()) {
-      if (locId === locationId || locId.startsWith(locationId) || locationId.startsWith(locId)) {
+    // 优先精确匹配；模糊匹配限制同楼层前缀且长度差不超过 1，避免 5001 串到 50011
+    const exact = locationStyleCodesMap.get(locationId);
+    if (exact) {
+      styleCodes.push(...exact);
+    } else {
+      for (const [locId, codes] of locationStyleCodesMap.entries()) {
+        const isPrefixMatch = locId.startsWith(locationId) || locationId.startsWith(locId);
+        if (!isPrefixMatch || locId[0] !== locationId[0] || Math.abs(locId.length - locationId.length) > 1) continue;
         codes.forEach(code => {
           if (!styleCodes.includes(code)) {
             styleCodes.push(code);
@@ -680,9 +748,10 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
     });
     
     // 按品类分组并排序
-    const shoes = allItems.filter(item => item.category === '鞋').sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 10);
-    const clothing = allItems.filter(item => item.category === '服装').sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 10);
-    const accessories = allItems.filter(item => item.category === '配件').sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 10);
+    const hasSales = (item: SkuDetail) => item.salesAmount > 0 || item.salesQuantity > 0;
+    const shoes = allItems.filter(item => item.category === '鞋' && hasSales(item)).sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 10);
+    const clothing = allItems.filter(item => item.category === '服装' && hasSales(item)).sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 10);
+    const accessories = allItems.filter(item => item.category === '配件' && hasSales(item)).sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 10);
     
     return { shoes, clothing, accessories };
   };
@@ -805,26 +874,35 @@ export function SalesDataProvider({ children }: { children: ReactNode }) {
     fetchData();
   }, []);
 
+  // 用 useMemo 稳定 value 引用，避免任意 state 更新都让全部 consumer 重渲染
+  const contextValue = useMemo<SalesDataContextType>(() => ({
+    data,
+    dataMap,
+    loading,
+    error,
+    lastFetchTime,
+    refresh: () => fetchData(true),
+    getLocationSkuDetails,
+    getGlobalSkuTop10,
+    getGlobalSkuTop10ByCategory,
+    getSubCategoryTop10,
+    getHourlySales,
+    getSubCategoryGenderHourTable,
+    updateLocationId,
+    getOnlineSkuTop10ByCategory,
+    getOnlineHourlySales,
+    getOnlineSubCategoryGenderHourTable,
+    getOnlineTotalStats,
+  }), [
+    data, dataMap, loading, error, lastFetchTime,
+    locationStyleCodesMap, inventoryMap, salesByStyleCode, categoryMap,
+    styleCodeLocationCount, styleCodeLocations, subCategorySales, hourlySales,
+    subCategoryGenderHour, onlineSalesByStyleCode, onlineSalesBySubCategory,
+    onlineSalesByHour, onlineSubCategoryGenderHour, onlineCategoryMap,
+  ]);
+
   return (
-    <SalesDataContext.Provider value={{ 
-      data, 
-      dataMap, 
-      loading, 
-      lastFetchTime,
-      refresh: () => fetchData(true),
-      getLocationSkuDetails,
-      getGlobalSkuTop10,
-      getGlobalSkuTop10ByCategory,
-      getSubCategoryTop10,
-      getHourlySales,
-      getSubCategoryGenderHourTable,
-      updateLocationId,
-      // 线上销售数据
-      getOnlineSkuTop10ByCategory,
-      getOnlineHourlySales,
-      getOnlineSubCategoryGenderHourTable,
-      getOnlineTotalStats,
-    }}>
+    <SalesDataContext.Provider value={contextValue}>
       {children}
     </SalesDataContext.Provider>
   );

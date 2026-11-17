@@ -129,11 +129,11 @@ function processMatchData(salesRecords: any[], locationRecords: any[], inventory
   salesRecords.forEach((record: any) => {
     const fields = record.fields || {};
     const styleCode = cleanFieldValue(fields['款号']);
-    const quantity = parseInt(cleanFieldValue(fields['数量'])) || 0;
-    const amount = parseInt(cleanFieldValue(fields['成交金额 (1)'])) ||
-                   parseInt(cleanFieldValue(fields['成交金额（1）'])) ||
-                   parseInt(cleanFieldValue(fields['成交金额'])) || 0;
-    const manualChangePrice = cleanFieldValue(fields['手工改价']) || cleanFieldValue(fields['手动改价']);
+    const quantity = parseInt(cleanFieldValue(fields['数量']), 10) || 0;
+    const amount = parseFloat(cleanFieldValue(fields['成交金额 (1)'])) ||
+                   parseFloat(cleanFieldValue(fields['成交金额（1）'])) ||
+                   parseFloat(cleanFieldValue(fields['成交金额'])) || 0;
+    const manualChangePrice = (cleanFieldValue(fields['手工改价']) || cleanFieldValue(fields['手动改价'])).trim().toUpperCase();
     const isOnline = manualChangePrice === 'Y';
     if (!styleCode) return;
 
@@ -226,8 +226,9 @@ function processMatchData(salesRecords: any[], locationRecords: any[], inventory
         if (sales && storeCount > 0) {
           existing.quantity += sales.quantity / storeCount;
           existing.amount += sales.amount / storeCount;
+          // 与 /api/feishu?action=match 保持同一口径：交易笔数同样按卖场区位数分摊
+          existing.count += sales.count / storeCount;
         }
-        existing.count += 1;
       }
     }
     locationSales.set(locationId, existing);
@@ -323,7 +324,10 @@ async function main() {
   for (const file of files) {
     const filePath = path.join(dataDir, file.name);
     const json = JSON.stringify(file.data);
-    fs.writeFileSync(filePath, json, 'utf-8');
+    // 原子写：避免构建/部署中途断掉留下半截 JSON 导致前端全量数据为空
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, json, 'utf-8');
+    fs.renameSync(tmpPath, filePath);
     const kb = json.length / 1024;
     totalSize += kb;
     console.log(`  ✅ ${file.name} (${kb.toFixed(1)} KB)`);

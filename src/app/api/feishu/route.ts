@@ -14,6 +14,15 @@ const LOCATION_TABLE_ID = process.env.FEISHU_LOCATION_TABLE_ID || 'tbl8f2AUadoiV
 const SALES_TABLE_ID = process.env.FEISHU_SALES_TABLE_ID || 'tbl6ACKuTrBFsBOP';
 const LAYOUT_CONFIG_TABLE_ID = process.env.FEISHU_LAYOUT_CONFIG_TABLE_ID || 'tblSCuhCIfNmZe1o';
 
+// 可选鉴权：设置 FEISHU_API_KEY 后，所有请求必须带 x-api-key 头。
+// 未设置时保持向后兼容（本地开发/内网静态部署无 API 路由）。
+const API_KEY = process.env.FEISHU_API_KEY || '';
+function requireApiKey(request: NextRequest): NextResponse | null {
+  if (!API_KEY) return null;
+  if (request.headers.get('x-api-key') === API_KEY) return null;
+  return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+}
+
 // 缓存 access_token
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
@@ -459,32 +468,20 @@ async function processBatch<T, R>(
   processFn: (item: T) => Promise<R>,
   concurrency: number = 10
 ): Promise<R[]> {
-  const results: R[] = [];
-  const executing: Promise<void>[] = [];
+  // 原实现用未赋值的 _settled 查找已完成 Promise，findIndex 恒为 -1，
+  // splice(-1,1) 会误删末尾任务；改为固定 worker 池，结果按输入顺序落位。
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
 
-  for (const item of items) {
-    const promise = processFn(item).then(result => {
-      results.push(result);
-    }).catch(error => {
-      console.error('Batch processing error:', error);
-      throw error;
-    });
-    executing.push(promise);
-
-    if (executing.length >= concurrency) {
-      await Promise.race(executing);
-      // 移除已完成的promise
-      executing.splice(
-        executing.findIndex(p => {
-          const s = p as any;
-          return s._settled;
-        }),
-        1
-      );
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const current = nextIndex++;
+      results[current] = await processFn(items[current]);
     }
-  }
+  });
 
-  await Promise.all(executing);
+  await Promise.all(workers);
   return results;
 }
 
@@ -564,6 +561,8 @@ function getFieldValue(fieldValue: any): any {
 }
 
 export async function GET(request: NextRequest) {
+  const unauthorized = requireApiKey(request);
+  if (unauthorized) return unauthorized;
   try {
     const searchParams = request.nextUrl.searchParams;
     const action = searchParams.get('action') || 'tables';
@@ -661,14 +660,14 @@ export async function GET(request: NextRequest) {
         const fields = record.fields || {};
         // 字段值已经是字符串格式，直接清理
         const styleCode = cleanFieldValue(fields['款号']);
-        const quantity = parseInt(cleanFieldValue(fields['数量'])) || 0;
-        // 尝试多个可能的金额字段名
-        const amount = parseInt(cleanFieldValue(fields['成交金额 (1)'])) || 
-                       parseInt(cleanFieldValue(fields['成交金额（1）'])) ||
-                       parseInt(cleanFieldValue(fields['成交金额'])) || 0;
-        
-        // 检查是否为线上数据（手工改价/手动改价="Y"）
-        const manualChangePrice = cleanFieldValue(fields['手工改价']) || cleanFieldValue(fields['手动改价']);
+        const quantity = parseInt(cleanFieldValue(fields['数量']), 10) || 0;
+        // 金额保留小数，避免 parseInt 截断造成销售额系统性偏低
+        const amount = parseFloat(cleanFieldValue(fields['成交金额 (1)'])) ||
+                       parseFloat(cleanFieldValue(fields['成交金额（1）'])) ||
+                       parseFloat(cleanFieldValue(fields['成交金额'])) || 0;
+
+        // 线上判定统一容忍大小写与首尾空格
+        const manualChangePrice = (cleanFieldValue(fields['手工改价']) || cleanFieldValue(fields['手动改价'])).trim().toUpperCase();
         const isOnline = manualChangePrice === 'Y';
         
         if (styleCode) {
@@ -1145,9 +1144,12 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const unauthorized = requireApiKey(request);
+  if (unauthorized) return unauthorized;
   try {
     const body = await request.json();
-    console.log('POST request body:', JSON.stringify(body));
+    // 不打印完整 body：背景图是 base64，会把几 MB 图片写进日志
+    console.log('POST action:', body?.action, 'floor:', body?.floor);
     
     // 保存布局配置到飞书表格
     if (body.action === 'saveLayout') {
